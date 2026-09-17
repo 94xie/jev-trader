@@ -63,6 +63,8 @@ export class Trader {
   private orders = new Map<number, Resting>();
   /** Live quotes sent but not yet confirmed; they may become resting orders, so they count toward the cap. */
   private inflight = new Map<string, Quote>();
+  /** Fills the trade-log poll produced before their block event was emitted; attached by `emit`. */
+  private pendingFills = new Map<number, Fill>();
   private simId = 0;
   private position = { mon: 0, costUsd: 0 }; // signed inventory and its cost basis
   private totals: Totals = { blocks: 0, decisions: 0, quotes: 0, fills: 0, reverted: 0, lateBlocks: 0, jevUsd: 0, gasMon: 0, gasUsd: 0, realizedUsd: 0, pnlUsd: 0, pnlMon: 0, pnlPct: 0 };
@@ -163,8 +165,14 @@ export class Trader {
     for (const [block, fs] of byBlock) {
       const fill = aggregate(fs);
       const e = this.history.find((h) => h.block === block);
-      if (e) e.fill = fill;
-      this.onFill(block, fill);
+      // The poll usually beats `emit` for the block it belongs to: hold the fill and let the block
+      // event carry it, so the stream stays block-then-fill and a client never sees a fill first.
+      if (e) {
+        e.fill = fill;
+        this.onFill(block, fill);
+      } else {
+        this.pendingFills.set(block, fill);
+      }
     }
   }
 
@@ -272,13 +280,16 @@ export class Trader {
     t.pnlMon = t.pnlUsd / book.mid;
     t.pnlPct = (t.pnlUsd / config.bankrollUsd) * 100;
     const size = Math.abs(this.position.mon);
+    const pending = this.pendingFills.get(block) ?? null;
+    if (pending) this.pendingFills.delete(block);
+    for (const b of this.pendingFills.keys()) if (b < block) this.pendingFills.delete(b); // skipped block: nothing left to attach it to
     const event: BlockEvent = {
       block, ts: Date.now(), mid: book.mid, bestBid: book.bid, bestAsk: book.ask, spreadBps: round(book.spreadBps, 2),
       decision: late
         ? { action: "hold", probabilities: { buy: 0, sell: 0, hold: 1 }, upIn10: 0.5, latencyMs: 0, late: true }
         : decision && { action: decision.action, probabilities: decision.probabilities, upIn10: decision.upIn10, latencyMs: Math.round(decision.latencyMs), late: false },
       quote,
-      fill: null,
+      fill: pending,
       resting: { bidMon: round(this.restingMon("buy"), 1), askMon: round(this.restingMon("sell"), 1) },
       position: {
         side: this.position.mon > 0 ? "long" : this.position.mon < 0 ? "short" : "flat",
@@ -290,6 +301,7 @@ export class Trader {
     if (this.history.length > config.historySize) this.history.shift();
     appendFileSync("data/events.jsonl", JSON.stringify(event) + "\n");
     this.onEvent(event, timing);
+    if (pending) this.onFill(block, pending);
   }
 }
 
